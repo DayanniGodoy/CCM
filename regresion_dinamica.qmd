@@ -1,0 +1,235 @@
+---
+title: "Regresión dinámica"
+format: html
+---
+
+```{r}
+#| message: false
+
+library(tidyverse)
+library(fpp3)
+library(ggtime)
+```
+
+```{r}
+fit_1 <- us_change |> 
+  model(reg = TSLM(Consumption ~ Income))
+
+fit_1 |> 
+  report()
+
+fit_1 |> 
+  gg_tsresiduals()
+
+fit_1 |> 
+  augment() |> 
+  features(.innov, ljung_box, lag = 10, dof = 2)
+```
+
+```{r}
+fit_2 <- us_change |> 
+  model(reg = ARIMA(Consumption ~ Income))
+
+fit_2 |> 
+  report()
+
+fit_2 |> 
+  gg_tsresiduals()
+
+fit_2 |> 
+  augment() |> 
+  features(.innov, ljung_box, lag = 10, dof = 2)
+```
+
+```{r}
+fit_2 <- us_change |> 
+  model(dyn_reg = TSLM(Consumption ~ Income + Production + Savings + Unemployment))
+
+fit_2 |> 
+  report()
+
+fit_2 |> 
+  gg_tsresiduals()
+
+fit_2 |> 
+  augment() |> 
+  features(.innov, ljung_box, lag = 10, dof = 6)
+```
+
+## Victoria electricity
+
+```{r}
+vic_elec_daily <- vic_elec |>
+  filter(year(Time) == 2014) |>
+  index_by(Date = date(Time)) |>
+  summarise(
+    Demand = sum(Demand)/1e3,
+    Temperature = max(Temperature),
+    Holiday = any(Holiday)
+  ) |>
+  mutate(Day_Type = case_when(
+    Holiday ~ "Holiday",
+    wday(Date) %in% 2:6 ~ "Weekday",
+    TRUE ~ "Weekend"
+  ))
+
+vic_elec_daily
+```
+
+```{r}
+vic_elec_daily |> 
+  autoplot(Demand)
+```
+
+```{r}
+vic_elec_daily |> 
+  ggplot(aes(x=Temperature, y=Demand, color = Day_Type)) +
+    geom_point() +
+    ylab("Electricity demand (GW)") +
+    xlab("Maximum daily temperature")
+```
+
+```{r}
+vic_fit <- vic_elec_daily |> 
+  model(
+    ARIMA(Demand ~ Temperature + I(Temperature^2) + (Day_Type=="Weekday") + season())
+  )
+
+vic_fit |> 
+  report()
+
+vic_fit |> 
+  gg_tsresiduals()
+```
+
+## Vic daily years
+
+```{r}
+vic_daily <- vic_elec |>
+  index_by(Date = date(Time)) |>
+  summarise(
+    Demand = sum(Demand)/1e3,
+    Temperature = max(Temperature),
+    Holiday = any(Holiday)
+  ) |>
+  mutate(Day_Type = case_when(
+    Holiday ~ "Holiday",
+    wday(Date) %in% 2:6 ~ "Weekday",
+    TRUE ~ "Weekend"
+  ))
+
+vic_daily |> 
+  autoplot(Demand)
+```
+
+## Valores rezagados de las predictoras
+
+```{r}
+insurance |> 
+  pivot_longer(Quotes:TVadverts) |>
+  ggplot(aes(x = Month, y = value)) +
+  geom_line() +
+  facet_grid(vars(name), scales = "free_y") +
+  labs(y = "", title = "Insurance advertising and quotations")
+```
+
+```{r}
+insurance_fit <- insurance |> 
+  mutate(Quotes = c(rep(NA,3), Quotes[4:40])) |> 
+  model(
+    lag0 = ARIMA(Quotes ~ pdq(d = 0) + TVadverts),
+    lag1 = ARIMA(Quotes ~ pdq(d = 0) + TVadverts + lag(TVadverts)),
+    lag2 = ARIMA(Quotes ~ pdq(d = 0) + TVadverts + lag(TVadverts) + lag(TVadverts, 2)),
+    lag3 = ARIMA(Quotes ~ pdq(d = 0) + TVadverts + lag(TVadverts) + lag(TVadverts, 2) + lag(TVadverts, 3))
+  )
+  
+glance(insurance_fit) |> 
+  arrange(AICc)
+```
+
+### Tendencia por Partes
+
+La historia del mercado inmobiliario (y de `PERMITNSA`) es:
+
+1.  **El Boom (2000-2005):** Crecimiento acelerado.
+
+2.  **La Burbuja/Crisis (2005-2011):** Caída estrepitosa.
+
+3.  **La Recuperación (2011-Adelante):** Crecimiento lento pero constante.
+
+Para modelar **3 fases** (subida, bajada, subida), necesitas definir **2 puntos de quiebre** (knots).
+
+```{r}
+#| message: false
+#| warning: false
+
+# Definimos la fecha del quiebre estructural
+fecha_quiebre <- yearmonth("2008 Jan")
+
+# Preparamos los datos creando las variables manuales para la regresión
+datos_piecewise <- datos_finales |>
+  mutate(
+    # 1. Tendencia lineal normal (t)
+    t = row_number(),
+    
+    # 2. El segmento "post-2008"
+    # Si la fecha es antes de 2008, vale 0. Si es después, cuenta 1, 2, 3...
+    # Esto permite que la pendiente cambie solo después de esa fecha.
+    t_post_2008 = pmax(0, t - which(Month == fecha_quiebre))
+  )
+
+# Verificamos que se crearon las columnas
+head(datos_piecewise |> select(Month, t, t_post_2008))
+```
+
+#### Ajuste del Modelo con Fourier y Tendencia por Partes
+
+Ahora ajustamos un modelo `ARIMA` que incluya:
+
+1.  **Predictores Económicos:** `DSPIC96` y `UNRATE` (tus mejores variables).
+
+2.  **Tendencia Piecewise:** Usamos `t` y `t_post_2008` como regresores.
+
+3.  **Estacionalidad Fourier:** Usamos `fourier(K=2)` para una onda suave (ahorra parámetros comparado con las 11 dummies mensuales).
+
+```{r}
+modelo_avanzado <- datos_piecewise |>
+  model(
+    arima_avanzado = ARIMA(PERMITNSA ~ 
+      # --- A. Predictores Económicos ---
+      DSPIC96 + 
+      UNRATE +
+      
+      # --- B. Tendencia por Partes (Piecewise) ---
+      t +            # Tendencia base
+      t_post_2008 +  # Cambio de pendiente después de 2008
+      
+      # --- C. Estacionalidad de Fourier ---
+      # K=2 suele ser suficiente para patrones mensuales suaves
+      fourier(K = 2, period = 12) + 
+      
+      # --- D. Errores ARIMA (Automático) ---
+      pdq() + PDQ(0,0,0) # Forzamos PDQ=0 porque Fourier ya maneja la estacionalidad
+    )
+  )
+
+report(modelo_avanzado)
+```
+
+#### Visualización del Cambio de Estructura
+
+Para entender realmente lo que hizo la "regresión por partes", vamos a graficar cómo el modelo capturó el cambio de tendencia.
+
+```{r}
+# Graficamos el ajuste
+augment(modelo_avanzado) |>
+  filter_index("2000 Jan" ~ "2015 Jan") |> # Zoom en la crisis para ver el quiebre
+  autoplot(PERMITNSA, color = "gray") +
+  geom_line(aes(y = .fitted), color = "#D55E00", linewidth = 1) +
+  geom_vline(xintercept = as.Date(fecha_quiebre), linetype = "dashed", color = "blue") +
+  labs(
+    title = "Modelo Avanzado: Tendencia Piecewise + Fourier",
+    subtitle = "La línea azul marca el 'Knot' (Enero 2008). Nota cómo la tendencia cambia drásticamente.",
+    y = "Permisos"
+  )
+```
